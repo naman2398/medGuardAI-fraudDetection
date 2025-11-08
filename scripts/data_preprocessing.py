@@ -122,6 +122,7 @@ def aggregate_features(df):
     group_keys = [
         "rndrng_npi", "year", "rndrng_prvdr_type", "place_of_srvc"
     ]
+    
     agg_targets = {
         "tot_srvcs": "line_srvc_cnt",
         "tot_benes": "bene_unique_cnt",
@@ -290,30 +291,16 @@ def create_fraud_labels(df_leie, years_list):
 
 
 def label_fraud_cases(df_enriched, df_fraud_npis):
-    """Join fraud labels to enriched dataset with year-aware filtering."""
+    """Join fraud labels to enriched dataset (no year filtering)."""
     logger.info("Labeling dataset with fraud indicators...")
     
-    # Prepare enriched data: cast year to int for comparison
-    df_enriched = df_enriched.withColumn("year_int", col("year").cast("int"))
+    # Get distinct fraud NPIs
+    df_fraud_distinct = df_fraud_npis.select('npi').distinct()
     
-    # Prepare fraud data: add year filter columns
-    df_fraud_filtered = df_fraud_npis.withColumn(
-        'reinstate_year',
-        when(col('reindate_parsed').isNotNull(), year(col('reindate_parsed')))
-        .otherwise(lit(9999))  # Use high value for never-reinstated
-    )
-    
-    # Filter fraud NPIs to only those active during each provider's year
-    df_fraud_active = df_fraud_filtered.filter(
-        col('excl_year').isNotNull()
-    )
-    
-    # Now do a simple join with year-based conditions
+    # Left join for labeling
     df_labeled = df_enriched.join(
-        df_fraud_active,
-        (df_enriched.rndrng_npi == df_fraud_active.npi) &
-        (df_fraud_active.excl_year <= df_enriched.year_int) &  # Excluded before/during year
-        (df_fraud_active.reinstate_year > df_enriched.year_int),  # Still excluded during year
+        df_fraud_distinct,
+        df_enriched.rndrng_npi == df_fraud_distinct.npi,
         how='left'
     )
     
@@ -323,12 +310,12 @@ def label_fraud_cases(df_enriched, df_fraud_npis):
         when(col('npi').isNotNull(), 1).otherwise(0)
     )
     
-    # Drop temporary and duplicate columns
-    df_labeled = df_labeled.drop('npi', 'excl_year', 'reindate_parsed', 'reinstate_year', 'year_int')
+    # Drop duplicate NPI column from join
+    df_labeled = df_labeled.drop('npi')
     
-    # Convert year back to string for consistency
-    df_labeled = df_labeled.withColumn("year", col("year").cast("string"))
-    
+    # Count fraud labels
+    fraud_label_count = df_labeled.filter(col('fraud_label') == 1).select('rndrng_npi').distinct().count()
+    logger.info(f"NPIs labeled as fraud: {fraud_label_count:,}")
     logger.info(f"Labeling completed. Dataset size: {df_labeled.count():,} records")
     
     return df_labeled
