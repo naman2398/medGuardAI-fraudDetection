@@ -18,14 +18,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-YEAR = "2023"
-BUCKET_BASE = f"gs://medguard_rawdata/raw/cms_partb_{YEAR}"
-ENRICH_BASE = f"gs://medguard_rawdata/raw/cms_partb_summary_{YEAR}"
+YEARS = ["2018", "2019", "2020", "2021", "2022", "2023"]
+BUCKET_BASE_DETAILS = "gs://medguard_rawdata/raw/cms_partb_details_data"
+BUCKET_BASE_SUMMARY = "gs://medguard_rawdata/raw/cms_partb_summary_data"
 LEIE_PATH = "gs://medguard_rawdata/raw/fraud_labels/"
-OUTPUT_PATH = "gs://medguard_rawdata/raw/cms_partb_labeled"
 
-BIGQUERY_DATASET = "medguard_processed"
-BIGQUERY_TABLE = "fraud_training_data"
+BIGQUERY_DATASET = "medguard_processed_all_years"
+BIGQUERY_TABLE = "fraud_training_data_all_years"
 BIGQUERY_LOCATION = "US"
 STAGING_BUCKET = "medguard_rawdata"
 
@@ -123,7 +122,6 @@ def aggregate_features(df):
     group_keys = [
         "rndrng_npi", "year", "rndrng_prvdr_type", "place_of_srvc"
     ]
-    
     agg_targets = {
         "tot_srvcs": "line_srvc_cnt",
         "tot_benes": "bene_unique_cnt",
@@ -162,19 +160,23 @@ def enrich_and_join(spark, df_aggregated):
     """Enrich aggregated data with provider-level summary statistics."""
     logger.info("Starting enrichment and join...")
     
-    enrich_path = f"{ENRICH_BASE}/*.parquet"
-    logger.info(f"Reading all enrichment parquet files from: {enrich_path}")
+    # Read all enrichment years at once
+    enrich_path = f"{BUCKET_BASE_SUMMARY}/cms_partb_summary_*/*.parquet"
+    logger.info(f"Reading all enrichment data from: {enrich_path}")
     
     df_prv_raw = spark.read.parquet(enrich_path)
     
     df_prv_raw = df_prv_raw.select([col(c).alias(c.lower()) for c in df_prv_raw.columns])
     
+    # Extract year from file path
     df_prv_raw = df_prv_raw.withColumn("source_file", input_file_name())
     df_prv_raw = df_prv_raw.withColumn(
         "year", 
-        regexp_extract("source_file", r'cms_partb_summary_(\d+)', 1)
+        regexp_extract("source_file", r'cms_partb_summary_(\d{4})', 1)
     )
     df_prv_raw = df_prv_raw.drop("source_file")
+    
+    logger.info("✓ Enrichment data loaded successfully from all years")
     
     drop_columns_prv = [
         "rndrng_prvdr_last_org_name", "rndrng_prvdr_first_name", "rndrng_prvdr_mi",
@@ -270,46 +272,64 @@ def load_leie_data(spark):
     return df_leie
 
 
-def create_fraud_labels(df_leie, target_year=2023):
-    """Create fraud label lookup table from LEIE data for target year."""
-    logger.info(f"Creating fraud labels for year {target_year}...")
+def create_fraud_labels(df_leie, years_list):
+    """Create fraud label lookup table from LEIE data for multiple years."""
+    logger.info(f"Creating fraud labels for years: {years_list}...")
     
+    # Filter to fraud-relevant exclusion types
     df_fraud = df_leie.filter(
         col('excltype').isin(FRAUD_EXCLTYPE_CODES)
     )
     
-    df_fraud_active = df_fraud.filter(
-        (col('excl_year') <= target_year) &
-        (
-            (col('reindate_parsed').isNull()) |
-            (year(col('reindate_parsed')) > target_year)
-        )
-    )
+    # Select relevant columns for year-based filtering
+    df_fraud_npis = df_fraud.select('npi', 'excl_year', 'reindate_parsed').distinct()
     
-    df_fraud_npis = df_fraud_active.select('npi').distinct()
-    df_fraud_npis = df_fraud_npis.withColumn('fraud_label', lit(1))
-    
-    logger.info("Fraud labels created")
+    logger.info(f"Total fraudulent NPIs in LEIE: {df_fraud_npis.count():,}")
     
     return df_fraud_npis
 
 
 def label_fraud_cases(df_enriched, df_fraud_npis):
-    """Join fraud labels to enriched dataset."""
+    """Join fraud labels to enriched dataset with year-aware filtering."""
     logger.info("Labeling dataset with fraud indicators...")
     
+    # Prepare enriched data: cast year to int for comparison
+    df_enriched = df_enriched.withColumn("year_int", col("year").cast("int"))
+    
+    # Prepare fraud data: add year filter columns
+    df_fraud_filtered = df_fraud_npis.withColumn(
+        'reinstate_year',
+        when(col('reindate_parsed').isNotNull(), year(col('reindate_parsed')))
+        .otherwise(lit(9999))  # Use high value for never-reinstated
+    )
+    
+    # Filter fraud NPIs to only those active during each provider's year
+    df_fraud_active = df_fraud_filtered.filter(
+        col('excl_year').isNotNull()
+    )
+    
+    # Now do a simple join with year-based conditions
     df_labeled = df_enriched.join(
-        df_fraud_npis,
-        df_enriched.rndrng_npi == df_fraud_npis.npi,
+        df_fraud_active,
+        (df_enriched.rndrng_npi == df_fraud_active.npi) &
+        (df_fraud_active.excl_year <= df_enriched.year_int) &  # Excluded before/during year
+        (df_fraud_active.reinstate_year > df_enriched.year_int),  # Still excluded during year
         how='left'
     )
     
+    # Create fraud label based on successful join
     df_labeled = df_labeled.withColumn(
         'fraud_label',
-        when(col('fraud_label').isNotNull(), 1).otherwise(0)
+        when(col('npi').isNotNull(), 1).otherwise(0)
     )
     
-    df_labeled = df_labeled.drop('npi')
+    # Drop temporary and duplicate columns
+    df_labeled = df_labeled.drop('npi', 'excl_year', 'reindate_parsed', 'reinstate_year', 'year_int')
+    
+    # Convert year back to string for consistency
+    df_labeled = df_labeled.withColumn("year", col("year").cast("string"))
+    
+    logger.info(f"Labeling completed. Dataset size: {df_labeled.count():,} records")
     
     return df_labeled
 
@@ -374,23 +394,21 @@ def prepare_for_training(df_encoded):
     """Prepare final feature set for machine learning."""
     logger.info("Preparing dataset for ML training...")
     
-    identifiers_to_drop = ['year']
-    df_train = df_encoded.drop(*identifiers_to_drop)
-    logger.info(f"Dropped identifier columns: {identifiers_to_drop}")
-    
-    feature_cols = [c for c in df_train.columns if c != 'fraud_label']
-    df_train = df_train.select(*feature_cols, 'fraud_label')
+    # Keep year column - it's valuable for temporal analysis
+    feature_cols = [c for c in df_encoded.columns if c != 'fraud_label']
+    df_train = df_encoded.select(*feature_cols, 'fraud_label')
     
     logger.info(f"Final feature count: {len(feature_cols)}")
     logger.info(f"Total columns: {len(df_train.columns)} (features + target)")
     
     agg_cols = [c for c in feature_cols if any(stat in c for stat in ['_min', '_max', '_mean', '_median', '_sum', '_std'])]
     ohe_cols = [c for c in feature_cols if '_ohe' in c]
-    other_cols = [c for c in feature_cols if c not in agg_cols and c not in ohe_cols]
+    other_cols = [c for c in feature_cols if c not in agg_cols and c not in ohe_cols and c != 'year']
     
     logger.info(f"  - Aggregated features: {len(agg_cols)}")
     logger.info(f"  - Enrichment features: {len(other_cols)}")
     logger.info(f"  - OHE features: {len(ohe_cols)}")
+    logger.info(f"  - Year column: included ✓")
     
     return df_train
 
@@ -441,9 +459,9 @@ def main():
     )
     logger.info("SparkSession initialized successfully")
     
-    # Read raw data files
-    raw_path = f"{BUCKET_BASE}/*.parquet"
-    logger.info(f"Reading all raw parquet files from: {raw_path}")
+    # Read all years at once using wildcard pattern
+    raw_path = f"{BUCKET_BASE_DETAILS}/cms_partb_details_*/*.parquet"
+    logger.info(f"Reading all years from: {raw_path}")
     
     df_raw = spark.read.parquet(raw_path)
     
@@ -451,9 +469,11 @@ def main():
     df_raw = df_raw.withColumn("source_file", input_file_name())
     df_raw = df_raw.withColumn(
         "year", 
-        regexp_extract("source_file", r'cms_partb_(\d+)', 1)
+        regexp_extract("source_file", r'cms_partb_details_(\d{4})', 1)
     )
     df_raw = df_raw.drop('source_file')
+    
+    logger.info("✓ Data loaded successfully from all years")
     
     # Phase 1: Cleaning
     logger.info("\n" + "="*60)
@@ -482,7 +502,7 @@ def main():
     logger.info("="*60)
     
     df_leie = load_leie_data(spark)
-    df_fraud_npis = create_fraud_labels(df_leie, target_year=int(YEAR))
+    df_fraud_npis = create_fraud_labels(df_leie, years_list=YEARS)
     df_labeled = label_fraud_cases(df_enriched, df_fraud_npis)
     
     df_labeled = df_labeled.cache()
