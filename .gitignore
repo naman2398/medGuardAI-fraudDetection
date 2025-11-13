@@ -36,7 +36,6 @@ medguard_venv/
 .DS_Store
 
 # Data Files (large files - don't commit)
-data/
 *.csv
 *.parquet
 *.json
