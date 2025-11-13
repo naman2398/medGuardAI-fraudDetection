@@ -1,0 +1,62 @@
+# Pipeline Configuration for Healthcare Fraud Detection
+
+# Data Configuration
+data:
+  gcs_bucket: "medguard_rawdata"  # Will be set via environment variable or updated here
+  training_data_path: "gs://medguard_rawdata/data_processed"  # Update with your bucket
+  n_rows_sample: 50000  # Set to a number (e.g., 100000) for testing, null for full dataset
+  
+# MLflow Configuration
+mlflow:
+  tracking_uri: "./mlruns"  # Local tracking (change to remote URI when available)
+  experiment_name: "healthcare-fraud-detection"
+  
+# Model Configuration
+models:
+  xgboost:
+    n_trials: 20  # Number of Optuna trials for HPO
+    cv_folds: 5   # Number of CV folds
+    random_state: 42
+    
+  lightgbm:
+    n_trials: 20
+    cv_folds: 5
+    random_state: 42
+    
+  stacker:
+    random_state: 42
+    max_iter: 1000
+    
+# Validation Strategy
+validation:
+  stratify_by: "rndrng_npi"  # Entity-level stratification (provider NPI)
+  target_column: "fraud_label"
+  positive_class_ratio: 0.0004  # 0.04%
+  
+# Dask Configuration
+dask:
+  use_distributed: false  # Set to true when running on GCP cluster
+  scheduler_address: null  # Will be set automatically in cluster mode
+  n_workers: 2
+  threads_per_worker: 4
+  memory_limit: "32GB"
+  
+# GCP Configuration (for deployment)
+gcp:
+  project_id: ""  # Update with your GCP project ID
+  region: "us-central1"
+  artifact_registry: ""  # Update with your artifact registry path
+  service_account: ""  # Update with your service account email
+  
+# Compute Configuration
+compute:
+  primary:
+    machine_type: "e2-standard-4"
+    vcpus: 4
+    memory_gb: 16
+  workers:
+    machine_type: "c3-standard-8"
+    vcpus: 8
+    memory_gb: 32
+    count: 2
+  use_preemptible: true  # Use preemptible VMs for cost savings
