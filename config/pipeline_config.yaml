@@ -1,26 +1,28 @@
 # Pipeline Configuration for Healthcare Fraud Detection
+# These are PRODUCTION defaults - override at runtime via environment variables
 
 # Data Configuration
 data:
-  gcs_bucket: "medguard_rawdata"  # Will be set via environment variable or updated here
-  training_data_path: "gs://medguard_rawdata/data_processed"  # Update with your bucket
-  n_rows_sample: 50000  # Set to a number (e.g., 100000) for testing, null for full dataset
+  gcs_bucket: "medguard_rawdata"
+  training_data_path: "gs://medguard_rawdata/data_processed"
+  n_rows_sample: null  # null = all data (production), override with N_ROWS_SAMPLE env var for testing
   
 # MLflow Configuration
 mlflow:
-  tracking_uri: "./mlruns"  # Local tracking (change to remote URI when available)
+  tracking_uri: "./mlruns"  # Local backend inside container
+  artifact_location: "gs://medguard_rawdata/models/mlflow_artifacts"  # GCS for large model files
   experiment_name: "healthcare-fraud-detection"
   
 # Model Configuration
 models:
   xgboost:
-    n_trials: 20  # Number of Optuna trials for HPO
-    cv_folds: 5   # Number of CV folds
+    n_trials: 20  # Production: 20 trials, override with XGB_TRIALS for testing
+    cv_folds: 5   # Production: 5 folds, override with CV_FOLDS for testing
     random_state: 42
     
   lightgbm:
-    n_trials: 20
-    cv_folds: 5
+    n_trials: 20  # Production: 20 trials, override with LGBM_TRIALS for testing
+    cv_folds: 5   # Production: 5 folds, override with CV_FOLDS for testing
     random_state: 42
     
   stacker:
@@ -35,18 +37,18 @@ validation:
   
 # Dask Configuration
 dask:
-  use_distributed: false  # Set to true when running on GCP cluster
-  scheduler_address: null  # Will be set automatically in cluster mode
+  use_distributed: true  # Production: distributed mode on Vertex AI
+  scheduler_address: null  # Auto-detected from cluster
   n_workers: 2
   threads_per_worker: 4
   memory_limit: "32GB"
   
-# GCP Configuration (for deployment)
+# GCP Configuration
 gcp:
-  project_id: ""  # Update with your GCP project ID
+  project_id: "involuted-fold-474521-h3"
   region: "us-central1"
-  artifact_registry: ""  # Update with your artifact registry path
-  service_account: ""  # Update with your service account email
+  artifact_registry: "us-central1-docker.pkg.dev/involuted-fold-474521-h3/medguardai-ml-training"
+  service_account: ""  # Optional: specify if needed
   
 # Compute Configuration
 compute:
@@ -55,8 +57,8 @@ compute:
     vcpus: 4
     memory_gb: 16
   workers:
-    machine_type: "c3-standard-8"
+    machine_type: "n2-standard-8"  # Production: n2-standard-8, override with WORKER_MACHINE for testing
     vcpus: 8
     memory_gb: 32
-    count: 2
-  use_preemptible: true  # Use preemptible VMs for cost savings
+    count: 2  # Production: 2 workers, override with WORKER_COUNT for testing
+  use_preemptible: true  # Use preemptible VMs for 60-80% cost savings
