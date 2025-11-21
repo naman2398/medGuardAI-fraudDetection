@@ -37,12 +37,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_runtime_config():
+    """
+    Override config with environment variables for flexible deployment.
+    Allows runtime parameterization without changing config files.
+    """
+    # Read base config
+    base_config = load_config("config/pipeline_config.yaml")
+    
+    # Get environment variable overrides
+    n_rows_sample = os.getenv('N_ROWS_SAMPLE')
+    xgb_trials = os.getenv('XGB_TRIALS')
+    lgbm_trials = os.getenv('LGBM_TRIALS')
+    cv_folds = os.getenv('CV_FOLDS')
+    worker_count = os.getenv('WORKER_COUNT')
+    
+    # Apply overrides if provided
+    if n_rows_sample is not None:
+        n_rows = int(n_rows_sample)
+        base_config['data']['n_rows_sample'] = None if n_rows == -1 else n_rows
+    
+    if xgb_trials is not None:
+        base_config['models']['xgboost']['n_trials'] = int(xgb_trials)
+    
+    if lgbm_trials is not None:
+        base_config['models']['lightgbm']['n_trials'] = int(lgbm_trials)
+    
+    if cv_folds is not None:
+        base_config['models']['xgboost']['cv_folds'] = int(cv_folds)
+        base_config['models']['lightgbm']['cv_folds'] = int(cv_folds)
+    
+    if worker_count is not None:
+        base_config['compute']['workers']['count'] = int(worker_count)
+    
+    # Note: Keep tracking_uri from config (supports both local ./mlruns and GCS)
+    # Artifact location will be set to GCS if specified in config
+    
+    # Log runtime configuration
+    logger.info("="*80)
+    logger.info("RUNTIME CONFIGURATION")
+    logger.info("="*80)
+    data_rows_info = 'ALL DATA' if base_config['data']['n_rows_sample'] is None else f"{base_config['data']['n_rows_sample']:,}"
+    logger.info(f"Data rows: {data_rows_info}")
+    logger.info(f"XGBoost trials: {base_config['models']['xgboost']['n_trials']}")
+    logger.info(f"LightGBM trials: {base_config['models']['lightgbm']['n_trials']}")
+    logger.info(f"CV folds: {base_config['models']['xgboost']['cv_folds']}")
+    logger.info(f"Worker count: {base_config['compute']['workers']['count']}")
+    logger.info(f"Distributed mode: {base_config['dask']['use_distributed']}")
+    logger.info(f"MLflow URI: {base_config['mlflow']['tracking_uri']}")
+    logger.info("="*80)
+    
+    return base_config
+
+
 class DistributedTrainer:
     """Main trainer class for distributed ensemble training."""
     
-    def __init__(self, config_path="config/pipeline_config.yaml"):
+    def __init__(self, config=None):
         """Initialize trainer with configuration."""
-        self.config = load_config(config_path)
+        self.config = config if config is not None else get_runtime_config()
         self.client = None
         self.df = None
         self.provider_labels = None
@@ -53,18 +106,49 @@ class DistributedTrainer:
     def setup_dask(self):
         """Setup Dask cluster (local or distributed)."""
         if self.config['dask']['use_distributed']:
-            # For GCP cluster - reads CLUSTER_SPEC environment variable
+            # Try to get scheduler address from environment
             scheduler_address = os.environ.get('DASK_SCHEDULER_ADDRESS')
+            
             if scheduler_address:
                 logger.info(f"Connecting to distributed Dask cluster at {scheduler_address}")
                 self.client = Client(scheduler_address)
             else:
-                logger.warning("Distributed mode enabled but no scheduler address found")
-                self._setup_local_cluster()
+                # Vertex AI cluster formation logic
+                cluster_spec = os.environ.get('CLUSTER_SPEC')
+                
+                if cluster_spec:
+                    logger.info("Vertex AI cluster detected, setting up Dask coordination...")
+                    import json
+                    spec = json.loads(cluster_spec)
+                    
+                    # Determine if this is primary or worker node
+                    # Primary is worker pool 0, Workers are worker pool 1
+                    task_type = os.environ.get('CLOUD_ML_TASK_TYPE', 'master')
+                    
+                    if task_type == 'master' or 'workerpool0' in task_type.lower():
+                        # This is the primary node - start scheduler
+                        logger.info("Starting Dask Scheduler on Primary node...")
+                        from dask.distributed import Scheduler
+                        scheduler = Scheduler()
+                        scheduler.start(port=8786)
+                        scheduler_address = f"tcp://0.0.0.0:8786"
+                        logger.info(f"Dask Scheduler started at {scheduler_address}")
+                        self.client = Client(scheduler_address)
+                    else:
+                        # This is a worker node - connect to primary
+                        logger.info("Worker node detected, connecting to Primary scheduler...")
+                        # In Vertex AI, primary node is accessible via cluster networking
+                        primary_address = "tcp://workerpool0-0:8786"
+                        self.client = Client(primary_address)
+                        logger.info(f"Connected to scheduler at {primary_address}")
+                else:
+                    logger.warning("Distributed mode enabled but no cluster info found, falling back to local")
+                    self._setup_local_cluster()
         else:
             self._setup_local_cluster()
             
         logger.info(f"Dask dashboard: {self.client.dashboard_link}")
+        logger.info(f"Dask cluster workers: {len(self.client.scheduler_info()['workers'])}")
         
     def _setup_local_cluster(self):
         """Setup local Dask cluster for testing."""
@@ -80,12 +164,20 @@ class DistributedTrainer:
         """Initialize MLflow tracking."""
         tracking_uri = self.config['mlflow']['tracking_uri']
         experiment_name = self.config['mlflow']['experiment_name']
+        artifact_location = self.config['mlflow'].get('artifact_location')
         
         mlflow.set_tracking_uri(tracking_uri)
-        mlflow.set_experiment(experiment_name)
+        
+        # Set experiment with artifact location if specified
+        if artifact_location:
+            mlflow.set_experiment(experiment_name, artifact_location=artifact_location)
+        else:
+            mlflow.set_experiment(experiment_name)
         
         logger.info(f"MLflow tracking URI: {tracking_uri}")
         logger.info(f"MLflow experiment: {experiment_name}")
+        if artifact_location:
+            logger.info(f"MLflow artifact location: {artifact_location}")
         
     def load_data(self):
         """Load and prepare training data."""
@@ -429,11 +521,24 @@ class DistributedTrainer:
         
         logger.info("All final models trained successfully")
         
-    def save_models(self, output_dir="models/artifacts"):
+    def save_models(self, output_dir=None):
         """Save all model artifacts."""
         logger.info("="*60)
         logger.info("STEP 7: Saving Model Artifacts")
         logger.info("="*60)
+        
+        # Determine output directory
+        if output_dir is None:
+            job_name = os.environ.get('JOB_NAME', 'local-training')
+            if self.config['dask']['use_distributed']:
+                # Save to GCS with job-specific path
+                bucket = self.config['data']['gcs_bucket']
+                output_dir = f"gs://{bucket}/models/artifacts/{job_name}"
+            else:
+                # Local path
+                output_dir = f"models/artifacts/{job_name}"
+        
+        logger.info(f"Saving models to: {output_dir}")
         
         # Create output directory
         output_path = Path(output_dir)

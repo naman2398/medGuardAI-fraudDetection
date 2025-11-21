@@ -1,6 +1,11 @@
 """
 Launch MLflow UI.
+Supports both local (./mlruns) and GCS (gs://...) tracking URIs.
+
 Usage: python scripts/view_mlflow_ui.py
+
+Note: For GCS URIs, ensure GOOGLE_APPLICATION_CREDENTIALS is set:
+  export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
 """
 
 import sys
@@ -25,8 +30,22 @@ def main():
     
     tracking_uri = config['mlflow']['tracking_uri']
     
+    # Check if GCS URI and warn about credentials
+    if tracking_uri.startswith('gs://'):
+        logger.info("Using GCS backend for MLflow")
+        logger.info("Ensure GOOGLE_APPLICATION_CREDENTIALS is set")
+        import os
+        if not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
+            logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set - authentication may fail")
+    
     logger.info(f"Launching MLflow UI at http://localhost:5000")
     logger.info(f"Tracking URI: {tracking_uri}")
+    logger.info("")
+    logger.info("This will show experiments from:")
+    logger.info("  - Local training runs (if any)")
+    logger.info("  - Vertex AI training jobs")
+    logger.info("")
+    logger.info("Press Ctrl+C to stop the UI")
     
     try:
         subprocess.run([
@@ -35,7 +54,7 @@ def main():
             "--port", "5000"
         ], check=True)
     except KeyboardInterrupt:
-        logger.info("MLflow UI stopped")
+        logger.info("\nMLflow UI stopped")
     except Exception as e:
         logger.error(f"Failed to launch UI: {e}")
         sys.exit(1)
