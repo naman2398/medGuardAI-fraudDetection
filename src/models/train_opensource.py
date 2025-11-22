@@ -3,6 +3,7 @@ Main training orchestrator for distributed ensemble ML pipeline.
 Implements HPO for XGBoost and LightGBM, then trains a stacked ensemble.
 """
 
+import argparse
 import logging
 import os
 import json
@@ -22,6 +23,8 @@ import mlflow.lightgbm
 
 from dask.distributed import Client, LocalCluster
 import dask.dataframe as dd
+import subprocess
+import time
 
 import sys
 sys.path.append('src')
@@ -37,38 +40,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_runtime_config():
-    """
-    Override config with environment variables for flexible deployment.
-    Allows runtime parameterization without changing config files.
-    """
-    # Read base config
+def parse_args():
+    """Parse command-line arguments for training configuration."""
+    parser = argparse.ArgumentParser(
+        description='Distributed Fraud Detection Training Pipeline'
+    )
+    
+    parser.add_argument('--n_rows_sample', type=int, default=-1,
+                        help='Number of rows to sample (-1 for all)')
+    parser.add_argument('--xgb_trials', type=int, default=20,
+                        help='Optuna trials for XGBoost')
+    parser.add_argument('--lgbm_trials', type=int, default=20,
+                        help='Optuna trials for LightGBM')
+    parser.add_argument('--cv_folds', type=int, default=5,
+                        help='Cross-validation folds')
+    parser.add_argument('--worker_count', type=int, default=2,
+                        help='Dask worker nodes')
+    
+    return parser.parse_args()
+
+
+def get_runtime_config(args):
+    """Apply command-line arguments to base config."""
     base_config = load_config("config/pipeline_config.yaml")
     
-    # Get environment variable overrides
-    n_rows_sample = os.getenv('N_ROWS_SAMPLE')
-    xgb_trials = os.getenv('XGB_TRIALS')
-    lgbm_trials = os.getenv('LGBM_TRIALS')
-    cv_folds = os.getenv('CV_FOLDS')
-    worker_count = os.getenv('WORKER_COUNT')
-    
-    # Apply overrides if provided
-    if n_rows_sample is not None:
-        n_rows = int(n_rows_sample)
-        base_config['data']['n_rows_sample'] = None if n_rows == -1 else n_rows
-    
-    if xgb_trials is not None:
-        base_config['models']['xgboost']['n_trials'] = int(xgb_trials)
-    
-    if lgbm_trials is not None:
-        base_config['models']['lightgbm']['n_trials'] = int(lgbm_trials)
-    
-    if cv_folds is not None:
-        base_config['models']['xgboost']['cv_folds'] = int(cv_folds)
-        base_config['models']['lightgbm']['cv_folds'] = int(cv_folds)
-    
-    if worker_count is not None:
-        base_config['compute']['workers']['count'] = int(worker_count)
+    # Apply arguments
+    base_config['data']['n_rows_sample'] = None if args.n_rows_sample == -1 else args.n_rows_sample
+    base_config['models']['xgboost']['n_trials'] = args.xgb_trials
+    base_config['models']['xgboost']['cv_folds'] = args.cv_folds
+    base_config['models']['lightgbm']['n_trials'] = args.lgbm_trials
+    base_config['models']['lightgbm']['cv_folds'] = args.cv_folds
+    base_config['compute']['workers']['count'] = args.worker_count
     
     # Note: Keep tracking_uri from config (supports both local ./mlruns and GCS)
     # Artifact location will be set to GCS if specified in config
@@ -104,52 +106,80 @@ class DistributedTrainer:
         self.best_params_lgbm = None
         
     def setup_dask(self):
-        """Setup Dask cluster (local or distributed)."""
-        if self.config['dask']['use_distributed']:
-            # Try to get scheduler address from environment
-            scheduler_address = os.environ.get('DASK_SCHEDULER_ADDRESS')
-            
-            if scheduler_address:
-                logger.info(f"Connecting to distributed Dask cluster at {scheduler_address}")
-                self.client = Client(scheduler_address)
-            else:
-                # Vertex AI cluster formation logic
-                cluster_spec = os.environ.get('CLUSTER_SPEC')
-                
-                if cluster_spec:
-                    logger.info("Vertex AI cluster detected, setting up Dask coordination...")
-                    import json
-                    spec = json.loads(cluster_spec)
-                    
-                    # Determine if this is primary or worker node
-                    # Primary is worker pool 0, Workers are worker pool 1
-                    task_type = os.environ.get('CLOUD_ML_TASK_TYPE', 'master')
-                    
-                    if task_type == 'master' or 'workerpool0' in task_type.lower():
-                        # This is the primary node - start scheduler
-                        logger.info("Starting Dask Scheduler on Primary node...")
-                        from dask.distributed import Scheduler
-                        scheduler = Scheduler()
-                        scheduler.start(port=8786)
-                        scheduler_address = f"tcp://0.0.0.0:8786"
-                        logger.info(f"Dask Scheduler started at {scheduler_address}")
-                        self.client = Client(scheduler_address)
-                    else:
-                        # This is a worker node - connect to primary
-                        logger.info("Worker node detected, connecting to Primary scheduler...")
-                        # In Vertex AI, primary node is accessible via cluster networking
-                        primary_address = "tcp://workerpool0-0:8786"
-                        self.client = Client(primary_address)
-                        logger.info(f"Connected to scheduler at {primary_address}")
-                else:
-                    logger.warning("Distributed mode enabled but no cluster info found, falling back to local")
-                    self._setup_local_cluster()
-        else:
+        """Setup Dask cluster for distributed training."""
+        if not self.config['dask']['use_distributed']:
+            logger.info("Distributed mode disabled, using LocalCluster")
             self._setup_local_cluster()
-            
-        logger.info(f"Dask dashboard: {self.client.dashboard_link}")
-        logger.info(f"Dask cluster workers: {len(self.client.scheduler_info()['workers'])}")
+            return
         
+        # Check for pre-configured external scheduler
+        scheduler_address = os.environ.get('DASK_SCHEDULER_ADDRESS')
+        if scheduler_address:
+            logger.info(f"Connecting to external scheduler at {scheduler_address}")
+            self.client = Client(scheduler_address)
+            logger.info(f"Connected - Dashboard: {self.client.dashboard_link}")
+            logger.info(f"Workers: {len(self.client.scheduler_info()['workers'])}")
+            return
+        
+        # Vertex AI: Check which worker pool we're in
+        worker_pool = int(os.environ.get('CLOUD_ML_WORKER_POOL_INDEX', -1))
+        
+        if worker_pool == -1:
+            # Local environment
+            logger.info("Local environment, using LocalCluster")
+            self._setup_local_cluster()
+        elif worker_pool == 0:
+            # Primary: Start scheduler and connect
+            self._start_scheduler_and_connect()
+        else:
+            # Worker: Start worker process and block
+            self._start_worker_and_block()
+        
+    def _start_scheduler_and_connect(self):
+        """Start Dask scheduler subprocess on primary node."""
+        logger.info("[PRIMARY] Starting Dask Scheduler...")
+        
+        # Start dask-scheduler in background
+        scheduler_proc = subprocess.Popen(
+            ['dask-scheduler', '--port', '8786', '--dashboard-address', ':8787'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        # Give scheduler time to start
+        time.sleep(5)
+        
+        # Connect client
+        scheduler_address = 'tcp://localhost:8786'
+        logger.info(f"Connecting to scheduler at {scheduler_address}")
+        self.client = Client(scheduler_address, timeout='60s')
+        logger.info(f"Dashboard: {self.client.dashboard_link}")
+        logger.info("Waiting for worker nodes to connect...")
+    
+    def _start_worker_and_block(self):
+        """Start Dask worker subprocess and block (worker nodes don't run training)."""
+        logger.info("[WORKER] Starting Dask Worker...")
+        
+        # Construct primary node hostname (Vertex AI naming convention)
+        # Format: {job-name}-workerpool0-0
+        job_name = os.environ.get('CLOUD_ML_JOB_ID', 'training')
+        primary_host = f"{job_name}-workerpool0-0"
+        scheduler_address = f"tcp://{primary_host}:8786"
+        
+        logger.info(f"Connecting to scheduler at {scheduler_address}")
+        
+        # Start dask-worker and block (this process becomes the worker)
+        subprocess.run([
+            'dask-worker',
+            scheduler_address,
+            '--nthreads', str(self.config['dask']['threads_per_worker']),
+            '--memory-limit', self.config['dask']['memory_limit']
+        ])
+        
+        # If worker exits, log and exit process
+        logger.info("Worker process completed")
+        exit(0)
+    
     def _setup_local_cluster(self):
         """Setup local Dask cluster for testing."""
         logger.info("Setting up local Dask cluster")
@@ -159,6 +189,8 @@ class DistributedTrainer:
             memory_limit=self.config['dask']['memory_limit']
         )
         self.client = Client(cluster)
+        logger.info(f"Dask dashboard: {self.client.dashboard_link}")
+        logger.info(f"Dask cluster workers: {len(self.client.scheduler_info()['workers'])}")
         
     def setup_mlflow(self):
         """Initialize MLflow tracking."""
@@ -621,7 +653,10 @@ class DistributedTrainer:
 
 def main():
     """Entry point for training script."""
-    trainer = DistributedTrainer()
+    args = parse_args()
+    config = get_runtime_config(args)
+    
+    trainer = DistributedTrainer(config=config)
     trainer.run_training()
 
 

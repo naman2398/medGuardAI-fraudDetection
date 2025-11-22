@@ -29,7 +29,11 @@ export ARTIFACT_REGISTRY="us-central1-docker.pkg.dev/involuted-fold-474521-h3/me
 # Generate job identifiers
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 JOB_NAME="fraud-training-${TIMESTAMP}"
-IMAGE_URI="${ARTIFACT_REGISTRY}/fraud-detection:latest"
+
+# Use timestamped tag for each submission + latest
+IMAGE_TAG="${TIMESTAMP}"
+IMAGE_URI="${ARTIFACT_REGISTRY}/fraud-detection:${IMAGE_TAG}"
+IMAGE_URI_LATEST="${ARTIFACT_REGISTRY}/fraud-detection:latest"
 
 echo "=========================================="
 echo "Job:      ${JOB_NAME}"
@@ -39,16 +43,19 @@ echo "Folds:    ${CV_FOLDS}"
 echo "Cluster:  ${PRIMARY_MACHINE} + ${WORKER_COUNT}x ${WORKER_MACHINE}"
 echo "=========================================="
 
-echo "Building Docker image..."
-docker build -t ${IMAGE_URI} -f training/Dockerfile .
+echo "Building Docker image (Docker will use cache if nothing changed)..."
+echo "Image tags: ${IMAGE_TAG}, latest"
+docker build --platform linux/amd64 -t ${IMAGE_URI} -t ${IMAGE_URI_LATEST} -f training/Dockerfile .
 
 echo "Pushing to Artifact Registry..."
 docker push ${IMAGE_URI}
+docker push ${IMAGE_URI_LATEST}
 
 echo "Submitting Vertex AI job..."
 
-WORKER_POOL_0="machine-type=${PRIMARY_MACHINE},replica-count=1,container-image-uri=${IMAGE_URI}"
-WORKER_POOL_1="machine-type=${WORKER_MACHINE},replica-count=${WORKER_COUNT},container-image-uri=${IMAGE_URI}"
+# Always use latest tag so jobs get the most recent image
+WORKER_POOL_0="machine-type=${PRIMARY_MACHINE},replica-count=1,container-image-uri=${IMAGE_URI_LATEST}"
+WORKER_POOL_1="machine-type=${WORKER_MACHINE},replica-count=${WORKER_COUNT},container-image-uri=${IMAGE_URI_LATEST}"
 
 gcloud ai custom-jobs create \
   --region=${REGION} \
@@ -59,6 +66,7 @@ gcloud ai custom-jobs create \
   --args="--xgb_trials=${XGB_TRIALS}" \
   --args="--lgbm_trials=${LGBM_TRIALS}" \
   --args="--cv_folds=${CV_FOLDS}" \
+  --args="--worker_count=${WORKER_COUNT}" \
   --project=${PROJECT_ID}
 
 echo ""

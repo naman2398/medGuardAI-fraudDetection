@@ -1,7 +1,7 @@
 # Dockerfile for MedGuardAI Fraud Detection Training Pipeline
 # Optimized for Vertex AI distributed training
 
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
@@ -25,5 +25,5 @@ COPY config/ ./config/
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Run training script
-CMD ["python", "src/models/train_opensource.py"]
+# Run training script (ENTRYPOINT allows args to be passed)
+ENTRYPOINT ["python", "src/models/train_opensource.py"]
