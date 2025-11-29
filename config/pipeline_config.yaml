@@ -9,7 +9,7 @@ data:
   
 # MLflow Configuration
 mlflow:
-  tracking_uri: "./mlruns"  # Local backend inside container
+  tracking_uri: "https://mlflow-server-855767627985.us-central1.run.app"
   artifact_location: "gs://medguard_rawdata/models/mlflow_artifacts"  # GCS for large model files
   experiment_name: "healthcare-fraud-detection"
   
@@ -37,11 +37,11 @@ validation:
   
 # Dask Configuration
 dask:
-  use_distributed: true  # Production: distributed mode on Vertex AI
+  use_distributed: true  # Enable distributed mode for multi-node Vertex AI
   scheduler_address: null  # Auto-detected from cluster
   n_workers: 2
   threads_per_worker: 4
-  memory_limit: "32GB"
+  memory_limit: "auto"  # Use 80% of available system memory
   
 # GCP Configuration
 gcp:
