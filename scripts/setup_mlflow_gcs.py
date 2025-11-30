@@ -1,7 +1,4 @@
-"""
-Setup MLflow with GCS backend.
-Usage: python scripts/setup_mlflow_gcs.py
-"""
+"""Setup MLflow with GCS backend."""
 
 import os
 import sys

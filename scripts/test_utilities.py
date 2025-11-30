@@ -1,7 +1,4 @@
-"""
-Test script for utility modules.
-Demonstrates data loading, CV splitting, and evaluation.
-"""
+"""Test script for utility modules."""
 
 import logging
 import sys
@@ -11,7 +8,6 @@ from utils.data_loader import load_config, load_training_data, validate_data, ge
 from utils.cv_splitter import create_provider_stratified_folds, split_data_by_providers
 from utils.evaluation import evaluate_fold, evaluate_cv_folds
 
-# Setup logging - only if not already configured
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(
         level=logging.INFO,
@@ -23,31 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 def test_utilities():
-    """Test all utility modules with sample data."""
+    """Test all utility modules."""
+    logger.info("Testing utility modules...")
     
-    logger.info("="*60)
-    logger.info("Testing Utility Modules")
-    logger.info("="*60)
-    
-    # Step 1: Load configuration
-    logger.info("\nStep 1: Loading configuration...")
     config = load_config()
-    logger.info(f"Config loaded: {config['data']['training_data_path']}")
-    
-    # Step 2: Load training data
-    logger.info("\nStep 2: Loading training data...")
     df = load_training_data(config, use_sample=True)
-    
-    # Step 3: Validate data
-    logger.info("\nStep 3: Validating data...")
     validate_data(df, config)
-    
-    # Step 4: Get provider labels for stratification
-    logger.info("\nStep 4: Computing provider-level labels...")
     provider_labels = get_provider_labels(df, config)
     
-    # Step 5: Create stratified folds
-    logger.info("\nStep 5: Creating stratified CV folds...")
     n_folds = config['models']['xgboost']['cv_folds']
     folds = create_provider_stratified_folds(
         provider_labels, 
@@ -55,8 +34,6 @@ def test_utilities():
         random_state=config['models']['xgboost']['random_state']
     )
     
-    # Step 6: Verify actual data splits for each fold
-    logger.info("\nStep 6: Verifying data record counts per fold...")
     target_col = config['validation']['target_column']
     stratify_col = config['validation']['stratify_by']
     
@@ -68,21 +45,18 @@ def test_utilities():
             stratify_col=stratify_col
         )
         
-        # Count records and frauds
         train_records = len(train_df)
         test_records = len(test_df)
         train_frauds = train_df[target_col].sum().compute()
         test_frauds = test_df[target_col].sum().compute()
         
         logger.info(
-            f"Fold {fold_idx + 1} Data Split: "
-            f"Train records={train_records:,} (frauds={train_frauds:,}), "
-            f"Test records={test_records:,} (frauds={test_frauds:,})"
+            f"Fold {fold_idx + 1}: "
+            f"Train={train_records:,} (fraud={train_frauds:,}), "
+            f"Test={test_records:,} (fraud={test_frauds:,})"
         )
     
-    logger.info("\n" + "="*60)
-    logger.info("Utility module testing completed successfully!")
-    logger.info("="*60)
+    logger.info("Utility module testing completed!")
 
 
 if __name__ == "__main__":

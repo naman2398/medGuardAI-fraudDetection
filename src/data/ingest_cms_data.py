@@ -7,8 +7,6 @@ from time import sleep
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Dictionary now clearly maps year to its unique API Endpoint URL ---
-
 API_ENDPOINTS_BY_YEAR = {
     2018: "https://data.cms.gov/data-api/v1/dataset/fb6d9fe8-38c1-4d24-83d4-0b7b291000b2/data",
     2019: "https://data.cms.gov/data-api/v1/dataset/c957b49e-1323-49e7-8678-c09da387551d/data",
@@ -36,15 +34,7 @@ MAX_RETRIES = 3
 INGEST_TYPE = "details"  # Options: "details" or "summary"
 
 def get_total_records(api_endpoint):
-    """
-    Retrieve the total count of records available from the API endpoint.
-    
-    Args:
-        api_endpoint: The CMS API endpoint URL
-    
-    Returns:
-        int: Total count of records if available, None otherwise
-    """
+    """Retrieve the total count of records from the API endpoint."""
     params = {'size': 1} 
     
     response = requests.get(api_endpoint, params=params) 
@@ -55,20 +45,7 @@ def get_total_records(api_endpoint):
     return None
 
 def fetch_batch(offset, size, api_endpoint):
-    """
-    Fetch a batch of records from the CMS API with retry logic.
-    
-    Args:
-        offset: Starting position for the batch
-        size: Number of records to fetch
-        api_endpoint: The CMS API endpoint URL
-    
-    Returns:
-        dict: JSON response containing the batch data
-    
-    Raises:
-        Exception: If all retry attempts fail
-    """
+    """Fetch a batch of records from the CMS API with retry logic."""
     params = {'offset': offset, 'size': size}
     
     for attempt in range(MAX_RETRIES):
@@ -86,13 +63,7 @@ def fetch_batch(offset, size, api_endpoint):
                 raise
 
 def create_year_folder(year, ingest_type):
-    """
-    Create the folder structure for a specific year in GCS.
-    
-    Args:
-        year: The data year for folder organization
-        ingest_type: Type of data being ingested ('summary' or 'detail')
-    """
+    """Create the folder structure for a specific year in GCS."""
     client = storage.Client(project=PROJECT_ID)
     bucket = client.bucket(BUCKET_NAME)
     
@@ -106,15 +77,7 @@ def create_year_folder(year, ingest_type):
         logger.info(f"Folder already exists: {folder_path}")
 
 def upload_to_gcs(df, batch_num, year, ingest_type):
-    """
-    Upload a DataFrame batch to Google Cloud Storage as a Parquet file.
-    
-    Args:
-        df: pandas DataFrame containing the batch data
-        batch_num: Sequential batch number for file naming
-        year: The data year for folder organization
-        ingest_type: Type of data being ingested ('summary' or 'detail')
-    """
+    """Upload a DataFrame batch to GCS as a Parquet file."""
     client = storage.Client(project=PROJECT_ID)
     bucket = client.bucket(BUCKET_NAME)
     
@@ -125,21 +88,8 @@ def upload_to_gcs(df, batch_num, year, ingest_type):
     logger.info(f"Uploaded batch {batch_num} ({len(df)} records) for year {year} ({ingest_type}) to GCS")
 
 def ingest_cms_data(year, api_endpoint, ingest_type):
-    """
-    Main function to ingest CMS data for a specific year.
-    
-    Orchestrates the complete data ingestion process including:
-    - Creating folder structure in GCS
-    - Fetching total record count
-    - Iteratively fetching and uploading batches
-    - Progress tracking and logging
-    
-    Args:
-        year: The data year to ingest
-        api_endpoint: The CMS API endpoint URL for the specific year
-        ingest_type: Type of data being ingested ('summary' or 'detail')
-    """
-    logger.info(f"* Starting ingestion for year: {year} ({ingest_type}) *")
+    """Main function to ingest CMS data for a specific year."""
+    logger.info(f"Starting ingestion for year: {year} ({ingest_type})")
     
     create_year_folder(year, ingest_type)
     

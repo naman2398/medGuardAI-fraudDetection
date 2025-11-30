@@ -1,74 +1,62 @@
 # Pipeline Configuration for Healthcare Fraud Detection
-# These are PRODUCTION defaults - override at runtime via environment variables
 
-# Data Configuration
 data:
   gcs_bucket: "medguard_rawdata"
   training_data_path: "gs://medguard_rawdata/data_processed"
-  n_rows_sample: null  # null = all data (production), override with N_ROWS_SAMPLE env var for testing
-  
-# MLflow Configuration
+  n_rows_sample: null
+
 mlflow:
   tracking_uri: "https://mlflow-server-855767627985.us-central1.run.app"
-  artifact_location: "gs://medguard_rawdata/models/mlflow_artifacts"  # GCS for large model files
+  artifact_location: "gs://medguard_rawdata/models/mlflow_artifacts"
   experiment_name: "healthcare-fraud-detection"
-  
-# Model Configuration
+
 models:
   xgboost:
-    n_trials: 5  # Production: 5 trials, override with XGB_TRIALS for testing
-    cv_folds: 3   # Production: 5 folds, override with CV_FOLDS for testing
+    n_trials: 5
+    cv_folds: 3
     random_state: 42
-    
   lightgbm:
-    n_trials: 5  # Production: 5 trials, override with LGBM_TRIALS for testing
-    cv_folds: 3   # Production: 5 folds, override with CV_FOLDS for testing
+    n_trials: 5
+    cv_folds: 3
     random_state: 42
-    
   stacker:
     random_state: 42
     max_iter: 1000
-    
-# Validation Strategy
-validation:
-  stratify_by: "rndrng_npi"  # Entity-level stratification (provider NPI)
-  target_column: "fraud_label"
-  positive_class_ratio: 0.0004  # 0.04%
 
-# Sampling Configuration (Model Enhancement)
+validation:
+  stratify_by: "rndrng_npi"
+  target_column: "fraud_label"
+  positive_class_ratio: 0.0004
+
 sampling:
-  undersample_enabled: true  # Enable aggressive undersampling for training
-  undersample_ratio: 100     # Normal:Fraud ratio (1:100 means 100 normal per 1 fraud)
-  
-# Evaluation Configuration (Model Enhancement)
+  undersample_enabled: true
+  undersample_ratio: 100
+
 evaluation:
-  decision_threshold: 0.0004  # Prior class probability for threshold-based metrics
-  primary_metric: "f2"        # F2-Score balances recall (2x weight) with precision
-  
-# Dask Configuration
+  decision_threshold: 0.0004
+  primary_metric: "f2"
+
 dask:
-  use_distributed: false  # Single high-memory machine for fastest compute
+  use_distributed: false
   scheduler_address: null
-  n_workers: 8            # Match vCPUs for parallel CV folds
-  threads_per_worker: 2   # 2 threads per worker = 16 total threads
-  memory_limit: "auto"    # Uses ~100GB on n2-highmem-16
-  
-# GCP Configuration
+  n_workers: 8
+  threads_per_worker: 2
+  memory_limit: "auto"
+
 gcp:
   project_id: "involuted-fold-474521-h3"
   region: "us-central1"
   artifact_registry: "us-central1-docker.pkg.dev/involuted-fold-474521-h3/medguardai-ml-training"
-  service_account: ""  # Optional: specify if needed
-  
-# Compute Configuration
+  service_account: ""
+
 compute:
   primary:
-    machine_type: "n2-highmem-16"  # High-memory for fastest compute
+    machine_type: "n2-highmem-16"
     vcpus: 16
     memory_gb: 128
   workers:
     machine_type: "n2-highmem-16"
     vcpus: 16
     memory_gb: 128
-    count: 0  # No workers needed - single machine mode
-  use_preemptible: true  # Use preemptible VMs for 60-80% cost savings
+    count: 0
+  use_preemptible: true

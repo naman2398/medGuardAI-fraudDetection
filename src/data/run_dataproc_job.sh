@@ -1,18 +1,15 @@
 #!/bin/bash
-# Submits the MedGuardAI PySpark job to Dataproc Serverless.
-set -e # Exit immediately if a command fails
+# Submit MedGuardAI PySpark job to Dataproc Serverless
+set -e
 
-# --- 1. Configuration Variables ---
 export PROJECT_ID="involuted-fold-474521-h3"
 export REGION="us-east1"
 export STAGING_BUCKET="medguard_rawdata"
 export SCRIPT_PATH="gs://medguard_rawdata/scripts/data_preprocessing.py"
 export BATCH_ID="medguard-enhancement-$(date +%s)"
-# Optimized for Z-score Window functions (memory-intensive)
 export SPARK_PROPERTIES="spark.executor.memory=12g,spark.executor.cores=4,spark.dynamicAllocation.enabled=true,spark.dynamicAllocation.minExecutors=4,spark.dynamicAllocation.maxExecutors=20,spark.dataproc.runtime.python.packages=google-cloud-bigquery"
 
-# --- 2. Submit the Job ---
-echo "Submitting Dataproc batch job: ${BATCH_ID}"
+echo "Submitting batch job: ${BATCH_ID}"
 
 gcloud dataproc batches submit pyspark ${SCRIPT_PATH} \
     --project=${PROJECT_ID} \
@@ -21,4 +18,4 @@ gcloud dataproc batches submit pyspark ${SCRIPT_PATH} \
     --staging-bucket=${STAGING_BUCKET} \
     --properties="${SPARK_PROPERTIES}"
 
-echo "Job ${BATCH_ID} submitted successfully."
+echo "Job ${BATCH_ID} submitted."
