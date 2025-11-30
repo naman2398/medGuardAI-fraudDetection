@@ -130,18 +130,7 @@
 
 ---
 
-## 7. Comparison with Literature Benchmarks
-
-| Study / Benchmark | AUCPR | AUROC | Fraud Rate | Notes |
-|-------------------|-------|-------|------------|-------|
-| Johnson & Khoshgoftaar (2023) | 0.072 | 0.91 | 0.05% | Medicare Part D claims |
-| This Work (MedGuardAI) | **0.085** | **0.93** | 0.04% | Medicare Part B providers |
-| Bauder et al. (2017) | 0.068 | 0.89 | 0.08% | Credit card fraud (similar imbalance) |
-| Random Baseline | 0.0004 | 0.50 | 0.04% | — |
-
----
-
-## 8. Limitations & Caveats
+## 7. Limitations & Caveats
 
 1. **Label Quality:** Fraud labels derived from LEIE exclusion list may have lag and missing cases
 2. **Threshold Sensitivity:** Metrics highly dependent on chosen decision threshold (0.0004)
@@ -150,7 +139,7 @@
 
 ---
 
-## 9. Recommended Operational Thresholds
+## 8. Recommended Operational Thresholds
 
 | Scenario | Threshold | Recall | Precision | Alert Volume |
 |----------|-----------|--------|-----------|--------------|

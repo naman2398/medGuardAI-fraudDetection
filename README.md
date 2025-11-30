@@ -282,16 +282,6 @@ service_density = total_services / total_beneficiaries
 
 ---
 
-## 📚 Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Data Prep Workflow](docs/dataprep_workflow.md) | PySpark preprocessing steps |
-| [ML Pipeline Design](docs/distributed_mlPipeline.md) | Distributed training architecture |
-| [Model Enhancements](docs/model_enhancement_design_plan.md) | Feature engineering specs |
-
----
-
 ## 🛠️ Tech Stack
 
 | Category | Technologies |
