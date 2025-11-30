@@ -16,12 +16,12 @@ mlflow:
 # Model Configuration
 models:
   xgboost:
-    n_trials: 5  # Production: 20 trials, override with XGB_TRIALS for testing
+    n_trials: 5  # Production: 5 trials, override with XGB_TRIALS for testing
     cv_folds: 3   # Production: 5 folds, override with CV_FOLDS for testing
     random_state: 42
     
   lightgbm:
-    n_trials: 5  # Production: 20 trials, override with LGBM_TRIALS for testing
+    n_trials: 5  # Production: 5 trials, override with LGBM_TRIALS for testing
     cv_folds: 3   # Production: 5 folds, override with CV_FOLDS for testing
     random_state: 42
     

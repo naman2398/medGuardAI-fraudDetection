@@ -190,6 +190,23 @@ class DistributedTrainer:
         sampling_config = self.config.get('sampling', {})
         self._undersample_enabled = sampling_config.get('undersample_enabled', False)
         self._undersample_ratio = sampling_config.get('undersample_ratio', 100)
+        
+        # Fold cache: stores precomputed (X_train, y_train, X_test, y_test) per fold
+        # Eliminates redundant undersampling across HPO trials (e.g., 34 calls → 3)
+        self._fold_cache = None
+    
+    def _fix_dtypes(self, df):
+        """
+        Fix data types for XGBoost/LightGBM compatibility.
+        Converts string columns (like 'year') to numeric.
+        """
+        for col in df.columns:
+            if df[col].dtype == 'object' or str(df[col].dtype) == 'string':
+                try:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+                except Exception:
+                    df[col] = df[col].astype('category')
+        return df
     
     def _prepare_fold_data(self, train_df, test_df, fold_idx, random_state, phase="CV"):
         """
@@ -234,7 +251,49 @@ class DistributedTrainer:
         y_test = test_df[target_col].compute()
         logger.info(f"  Fold {fold_idx + 1}: Test ready - {len(X_test):,} rows")
         
+        # Fix dtypes for XGBoost/LightGBM compatibility (e.g., 'year' column is string)
+        X_train = self._fix_dtypes(X_train)
+        X_test = self._fix_dtypes(X_test)
+        
         return X_train, y_train, X_test, y_test
+    
+    def _precompute_folds(self):
+        """
+        Precompute undersampled fold data ONCE before HPO.
+        
+        This eliminates redundant undersampling across trials:
+        - Before: 5 trials × 3 folds × 2 models = 30 undersample calls
+        - After: 3 undersample calls (one per fold)
+        
+        The cache is reused by _run_cv() and generate_oof_predictions().
+        """
+        logger.info("="*60)
+        logger.info("PRECOMPUTING FOLD DATA (eliminates redundant undersampling)")
+        logger.info("="*60)
+        
+        stratify_col = self.config['validation']['stratify_by']
+        random_state = self.config['models']['xgboost']['random_state']
+        
+        self._fold_cache = {}
+        
+        for fold_idx, (train_providers, test_providers) in enumerate(self.folds):
+            logger.info(f"Precomputing fold {fold_idx + 1}/{len(self.folds)}...")
+            
+            # Split data (lazy Dask operation)
+            train_df, test_df = split_data_by_providers(
+                self.df, train_providers, test_providers, stratify_col
+            )
+            
+            # Prepare fold data (applies undersampling + compute)
+            X_train, y_train, X_test, y_test = self._prepare_fold_data(
+                train_df, test_df, fold_idx, random_state
+            )
+            
+            # Cache the computed data
+            self._fold_cache[fold_idx] = (X_train, y_train, X_test, y_test)
+            logger.info(f"Fold {fold_idx + 1} cached: train={len(X_train):,}, test={len(X_test):,}")
+        
+        logger.info(f"Fold cache complete: {len(self._fold_cache)} folds ready for HPO")
         
     def setup_dask(self):
         """Setup Dask cluster for distributed training."""
@@ -450,15 +509,18 @@ class DistributedTrainer:
         for fold_idx, (train_providers, test_providers) in enumerate(self.folds):
             logger.info(f"  Fold {fold_idx + 1}/{len(self.folds)}: Starting...")
             
-            # Split data (lazy Dask operation)
-            train_df, test_df = split_data_by_providers(
-                self.df, train_providers, test_providers, stratify_col
-            )
-            
-            # Prepare fold data (handles undersampling + compute)
-            X_train, y_train, X_test, y_test = self._prepare_fold_data(
-                train_df, test_df, fold_idx, random_state
-            )
+            # Use cached fold data (precomputed once before HPO)
+            if self._fold_cache is not None and fold_idx in self._fold_cache:
+                X_train, y_train, X_test, y_test = self._fold_cache[fold_idx]
+                logger.info(f"  Fold {fold_idx + 1}: Using cached data (train={len(X_train):,}, test={len(X_test):,})")
+            else:
+                # Fallback: compute on-the-fly (shouldn't happen in normal flow)
+                train_df, test_df = split_data_by_providers(
+                    self.df, train_providers, test_providers, stratify_col
+                )
+                X_train, y_train, X_test, y_test = self._prepare_fold_data(
+                    train_df, test_df, fold_idx, random_state
+                )
             
             # Train model
             logger.info(f"  Fold {fold_idx + 1}: Training {model_name} on {len(X_train):,} rows...")
@@ -581,15 +643,18 @@ class DistributedTrainer:
         for fold_idx, (train_providers, test_providers) in enumerate(self.folds):
             logger.info(f"Processing fold {fold_idx + 1}/{len(self.folds)}")
             
-            # Split data (lazy Dask operation)
-            train_df, test_df = split_data_by_providers(
-                self.df, train_providers, test_providers, stratify_col
-            )
-            
-            # Prepare fold data (handles undersampling + compute)
-            X_train, y_train, X_test, y_test = self._prepare_fold_data(
-                train_df, test_df, fold_idx, random_state=42, phase="OOF"
-            )
+            # Use cached fold data (same as HPO phase)
+            if self._fold_cache is not None and fold_idx in self._fold_cache:
+                X_train, y_train, X_test, y_test = self._fold_cache[fold_idx]
+                logger.info(f"  Fold {fold_idx + 1}: Using cached data (train={len(X_train):,}, test={len(X_test):,})")
+            else:
+                # Fallback: compute on-the-fly
+                train_df, test_df = split_data_by_providers(
+                    self.df, train_providers, test_providers, stratify_col
+                )
+                X_train, y_train, X_test, y_test = self._prepare_fold_data(
+                    train_df, test_df, fold_idx, random_state=42, phase="OOF"
+                )
             
             # Get test indices
             test_mask = provider_col.isin(test_providers)
@@ -677,6 +742,9 @@ class DistributedTrainer:
         logger.info("Computing training data...")
         X_full = df_to_train.drop(columns=[target_col, stratify_col]).compute()
         y_full = df_to_train[target_col].compute()
+        
+        # Fix dtypes for XGBoost/LightGBM compatibility (e.g., 'year' column is string)
+        X_full = self._fix_dtypes(X_full)
         
         logger.info(f"Training on dataset: {len(X_full):,} rows")
         
@@ -818,6 +886,9 @@ class DistributedTrainer:
             
             # Load data
             self.load_data()
+            
+            # Precompute folds once (eliminates redundant undersampling in HPO)
+            self._precompute_folds()
             
             # HPO
             self.optimize_xgboost()
