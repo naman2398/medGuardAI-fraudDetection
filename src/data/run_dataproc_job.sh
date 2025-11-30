@@ -7,8 +7,9 @@ export PROJECT_ID="involuted-fold-474521-h3"
 export REGION="us-east1"
 export STAGING_BUCKET="medguard_rawdata"
 export SCRIPT_PATH="gs://medguard_rawdata/scripts/data_preprocessing.py"
-export BATCH_ID="medguard-bq-create-$(date +%s)"
-export SPARK_PROPERTIES="spark.executor.memory=8g,spark.executor.cores=4,spark.dynamicAllocation.enabled=true,spark.dynamicAllocation.minExecutors=2,spark.dynamicAllocation.maxExecutors=10,spark.dataproc.runtime.python.packages=google-cloud-bigquery"
+export BATCH_ID="medguard-enhancement-$(date +%s)"
+# Optimized for Z-score Window functions (memory-intensive)
+export SPARK_PROPERTIES="spark.executor.memory=12g,spark.executor.cores=4,spark.dynamicAllocation.enabled=true,spark.dynamicAllocation.minExecutors=4,spark.dynamicAllocation.maxExecutors=20,spark.dataproc.runtime.python.packages=google-cloud-bigquery"
 
 # --- 2. Submit the Job ---
 echo "Submitting Dataproc batch job: ${BATCH_ID}"

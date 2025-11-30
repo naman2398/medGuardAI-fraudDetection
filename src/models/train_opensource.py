@@ -10,6 +10,7 @@ import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
 import joblib
 
 import xgboost as xgb
@@ -38,6 +39,70 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def undersample_dask_dataframe(train_df, target_col, ratio=100, random_state=42):
+    """
+    Undersample within Dask BEFORE .compute() to avoid memory issues.
+    
+    Per design doc Section 3.1:
+    - Training fold: 1:100 ratio (Fraud:Normal)
+    - Isolate all Fraud cases (N_fraud)
+    - Sample Normal cases (N_normal = N_fraud × 100)
+    - Reduces ~5M rows to ~100K rows before memory hit
+    
+    Args:
+        train_df: Dask DataFrame with training data
+        target_col: Name of target column (fraud_label)
+        ratio: Target ratio of normal to fraud cases (default: 100)
+        random_state: Random seed for reproducibility
+        
+    Returns:
+        Undersampled Dask DataFrame (lazy - not yet computed)
+    """
+    logger.info(f"    [DASK UNDERSAMPLE] Starting Dask-level undersampling (ratio 1:{ratio})...")
+    
+    # CRITICAL FIX: Reset index to avoid Dask partition alignment issues
+    # When filtering Dask DataFrames with boolean masks, the mask must align with
+    # the DataFrame's partition boundaries. Resetting index ensures clean alignment.
+    logger.info("    [DASK UNDERSAMPLE] Resetting index for partition alignment...")
+    train_df = train_df.reset_index(drop=True)
+    
+    # Persist the dataframe to materialize it before filtering
+    # This ensures the boolean mask aligns with actual data partitions
+    train_df = train_df.persist()
+    
+    # Separate fraud and normal using boolean indexing (now safe after reset_index + persist)
+    fraud_df = train_df[train_df[target_col] == 1]
+    normal_df = train_df[train_df[target_col] == 0]
+    
+    # Get counts - compute() needed for Dask delayed scalars
+    logger.info("    [DASK UNDERSAMPLE] Computing class counts...")
+    n_fraud = fraud_df.shape[0].compute()
+    n_normal = normal_df.shape[0].compute()
+    
+    logger.info(f"    [DASK UNDERSAMPLE] Original: Fraud={n_fraud:,}, Normal={n_normal:,}")
+    
+    # Calculate sampling fraction per design doc: N_normal = N_fraud × ratio
+    n_normal_target = min(n_fraud * ratio, n_normal)
+    sample_frac = n_normal_target / n_normal if n_normal > 0 else 0
+    
+    logger.info(f"    [DASK UNDERSAMPLE] Sampling {sample_frac:.4%} of normal cases ({n_normal_target:,} rows)")
+    
+    # Sample normal rows in Dask (lazy operation)
+    sampled_normal = normal_df.sample(frac=sample_frac, random_state=random_state)
+    
+    # Concatenate fraud + sampled normal (lazy operation)
+    undersampled_df = dd.concat([fraud_df, sampled_normal])
+    
+    # Repartition to optimize downstream compute
+    n_partitions = max(1, (n_fraud + n_normal_target) // 50000)  # ~50K rows per partition
+    undersampled_df = undersampled_df.repartition(npartitions=n_partitions)
+    
+    logger.info(f"    [DASK UNDERSAMPLE] Result: ~{n_fraud + n_normal_target:,} rows in {n_partitions} partitions")
+    logger.info(f"    >>> UNDERSAMPLING COMPLETE: Ratio 1:{ratio} (Fraud:{n_fraud:,}, Normal:{n_normal_target:,}) <<<")
+    
+    return undersampled_df
 
 
 def parse_args():
@@ -89,6 +154,22 @@ def get_runtime_config(args):
     logger.info(f"MLflow URI: {base_config['mlflow']['tracking_uri']}")
     logger.info("="*80)
     
+    # Log sampling configuration prominently (per design doc Section 3.1)
+    sampling_config = base_config.get('sampling', {})
+    undersample_enabled = sampling_config.get('undersample_enabled', False)
+    undersample_ratio = sampling_config.get('undersample_ratio', 100)
+    logger.info("SAMPLING CONFIGURATION")
+    logger.info("="*80)
+    if undersample_enabled:
+        logger.info(f">>> UNDERSAMPLING ENABLED <<<")
+        logger.info(f"    Ratio: 1:{undersample_ratio} (Fraud:Normal)")
+        logger.info(f"    Method: Dask-level (before .compute() to avoid OOM)")
+        logger.info(f"    Per design doc Section 3.1: Aggressive Undersampling")
+    else:
+        logger.info(">>> UNDERSAMPLING DISABLED <<<")
+        logger.info("    Using full training data (may cause memory issues)")
+    logger.info("="*80)
+    
     return base_config
 
 
@@ -104,6 +185,56 @@ class DistributedTrainer:
         self.folds = None
         self.best_params_xgb = None
         self.best_params_lgbm = None
+        
+        # Cache sampling config (accessed frequently)
+        sampling_config = self.config.get('sampling', {})
+        self._undersample_enabled = sampling_config.get('undersample_enabled', False)
+        self._undersample_ratio = sampling_config.get('undersample_ratio', 100)
+    
+    def _prepare_fold_data(self, train_df, test_df, fold_idx, random_state, phase="CV"):
+        """
+        Prepare train/test data for a fold with optional undersampling.
+        
+        Centralizes the repeated pattern of:
+        1. Apply Dask-level undersampling on training fold
+        2. Compute training data
+        3. Compute test data (full, no undersampling)
+        
+        Args:
+            train_df: Dask DataFrame for training fold
+            test_df: Dask DataFrame for test fold  
+            fold_idx: Current fold index (0-based)
+            random_state: Base random state for reproducibility
+            phase: Logging context ("CV", "OOF", etc.)
+            
+        Returns:
+            X_train, y_train, X_test, y_test as pandas objects
+        """
+        target_col = self.config['validation']['target_column']
+        stratify_col = self.config['validation']['stratify_by']
+        
+        # Apply Dask-level undersampling BEFORE .compute() to avoid OOM
+        if self._undersample_enabled:
+            logger.info(f"  Fold {fold_idx + 1}: Applying Dask undersampling...")
+            train_df = undersample_dask_dataframe(
+                train_df, target_col,
+                ratio=self._undersample_ratio,
+                random_state=random_state + fold_idx
+            )
+        
+        # Compute training data (undersampled if enabled)
+        logger.info(f"  Fold {fold_idx + 1}: Computing training data...")
+        X_train = train_df.drop(columns=[target_col, stratify_col]).compute()
+        y_train = train_df[target_col].compute()
+        logger.info(f"  Fold {fold_idx + 1}: Train ready - {len(X_train):,} rows {'[UNDERSAMPLED]' if self._undersample_enabled else ''}")
+        
+        # Test set: Keep full (per design doc - real-world imbalance for validation)
+        logger.info(f"  Fold {fold_idx + 1}: Computing test data...")
+        X_test = test_df.drop(columns=[target_col, stratify_col]).compute()
+        y_test = test_df[target_col].compute()
+        logger.info(f"  Fold {fold_idx + 1}: Test ready - {len(X_test):,} rows")
+        
+        return X_train, y_train, X_test, y_test
         
     def setup_dask(self):
         """Setup Dask cluster for distributed training."""
@@ -200,16 +331,13 @@ class DistributedTrainer:
         
         mlflow.set_tracking_uri(tracking_uri)
         
-        # Set experiment with artifact location if specified
-        if artifact_location:
-            mlflow.set_experiment(experiment_name, artifact_location=artifact_location)
-        else:
-            mlflow.set_experiment(experiment_name)
+        # Set experiment (artifact_location is configured server-side or via env var)
+        mlflow.set_experiment(experiment_name)
         
         logger.info(f"MLflow tracking URI: {tracking_uri}")
         logger.info(f"MLflow experiment: {experiment_name}")
         if artifact_location:
-            logger.info(f"MLflow artifact location: {artifact_location}")
+            logger.info(f"MLflow artifact location (configured): {artifact_location}")
         
     def load_data(self):
         """Load and prepare training data."""
@@ -242,11 +370,13 @@ class DistributedTrainer:
         logger.info("STEP 2: XGBoost Hyperparameter Optimization")
         logger.info("="*60)
         
-        with mlflow.start_run(run_name="xgb-hpo-study") as parent_run:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with mlflow.start_run(run_name=f"xgb-hpo-study_{timestamp}") as parent_run:
             
             def objective(trial):
                 """Optuna objective for XGBoost."""
                 # Suggest hyperparameters
+                # scale_pos_weight: [25, 100] calibrated for 1:100 undersampling ratio
                 params = {
                     'max_depth': trial.suggest_int('max_depth', 3, 10),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
@@ -254,7 +384,7 @@ class DistributedTrainer:
                     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
                     'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
                     'gamma': trial.suggest_float('gamma', 0, 5),
-                    'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1, 100),
+                    'scale_pos_weight': trial.suggest_float('scale_pos_weight', 25, 100),
                     'objective': 'binary:logistic',
                     'eval_metric': 'aucpr',
                     'tree_method': 'hist',
@@ -294,30 +424,50 @@ class DistributedTrainer:
             mlflow.log_params(self.best_params_xgb)
             mlflow.log_metric("best_cv_aucpr", study.best_value)
             
-    def _run_cv_xgboost(self, params, trial_num):
-        """Run cross-validation for XGBoost."""
-        logger.info(f"XGBoost trial {trial_num}: Running {len(self.folds)}-fold CV")
+    def _run_cv(self, params, trial_num, model_type='xgboost'):
+        """
+        Unified cross-validation runner for both XGBoost and LightGBM.
         
-        target_col = self.config['validation']['target_column']
+        Args:
+            params: Model hyperparameters
+            trial_num: Optuna trial number
+            model_type: 'xgboost' or 'lightgbm'
+        """
+        model_name = 'XGBoost' if model_type == 'xgboost' else 'LightGBM'
+        logger.info(f"{model_name} trial {trial_num}: Running {len(self.folds)}-fold CV")
+        
         stratify_col = self.config['validation']['stratify_by']
+        random_state = self.config['models'][model_type]['random_state']
+        
+        # Log undersampling status once per trial
+        if self._undersample_enabled:
+            logger.info(f"  >>> UNDERSAMPLING ACTIVE: Ratio 1:{self._undersample_ratio} (Dask-level) <<<")
+        else:
+            logger.info("  [UNDERSAMPLE] Disabled - using full training data")
         
         aucpr_scores = []
         
         for fold_idx, (train_providers, test_providers) in enumerate(self.folds):
-            # Split data
+            logger.info(f"  Fold {fold_idx + 1}/{len(self.folds)}: Starting...")
+            
+            # Split data (lazy Dask operation)
             train_df, test_df = split_data_by_providers(
                 self.df, train_providers, test_providers, stratify_col
             )
             
-            # Prepare data
-            X_train = train_df.drop(columns=[target_col, stratify_col]).compute()
-            y_train = train_df[target_col].compute()
-            X_test = test_df.drop(columns=[target_col, stratify_col]).compute()
-            y_test = test_df[target_col].compute()
+            # Prepare fold data (handles undersampling + compute)
+            X_train, y_train, X_test, y_test = self._prepare_fold_data(
+                train_df, test_df, fold_idx, random_state
+            )
             
             # Train model
-            model = xgb.XGBClassifier(**params)
-            model.fit(X_train, y_train, verbose=False)
+            logger.info(f"  Fold {fold_idx + 1}: Training {model_name} on {len(X_train):,} rows...")
+            if model_type == 'xgboost':
+                model = xgb.XGBClassifier(**params)
+                model.fit(X_train, y_train, verbose=False)
+            else:
+                model = lgb.LGBMClassifier(**params)
+                model.fit(X_train, y_train)
             
             # Predict and evaluate
             y_pred_proba = model.predict_proba(X_test)[:, 1]
@@ -331,6 +481,10 @@ class DistributedTrainer:
         logger.info(f"Trial {trial_num} CV AUCPR: {cv_mean:.4f} ± {cv_std:.4f}")
         
         return cv_mean
+    
+    def _run_cv_xgboost(self, params, trial_num):
+        """Run cross-validation for XGBoost."""
+        return self._run_cv(params, trial_num, model_type='xgboost')
         
     def optimize_lightgbm(self):
         """Run HPO for LightGBM using Optuna."""
@@ -338,11 +492,13 @@ class DistributedTrainer:
         logger.info("STEP 3: LightGBM Hyperparameter Optimization")
         logger.info("="*60)
         
-        with mlflow.start_run(run_name="lgbm-hpo-study") as parent_run:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with mlflow.start_run(run_name=f"lgbm-hpo-study_{timestamp}") as parent_run:
             
             def objective(trial):
                 """Optuna objective for LightGBM."""
                 # Suggest hyperparameters
+                # scale_pos_weight: [25, 100] calibrated for 1:100 undersampling ratio
                 params = {
                     'max_depth': trial.suggest_int('max_depth', 3, 10),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
@@ -352,7 +508,7 @@ class DistributedTrainer:
                     'min_child_weight': trial.suggest_float('min_child_weight', 0.001, 10, log=True),
                     'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
                     'reg_lambda': trial.suggest_float('reg_lambda', 0, 10),
-                    'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1, 100),
+                    'scale_pos_weight': trial.suggest_float('scale_pos_weight', 25, 100),
                     'objective': 'binary',
                     'metric': 'auc',
                     'random_state': self.config['models']['lightgbm']['random_state'],
@@ -394,41 +550,7 @@ class DistributedTrainer:
             
     def _run_cv_lightgbm(self, params, trial_num):
         """Run cross-validation for LightGBM."""
-        logger.info(f"LightGBM trial {trial_num}: Running {len(self.folds)}-fold CV")
-        
-        target_col = self.config['validation']['target_column']
-        stratify_col = self.config['validation']['stratify_by']
-        
-        aucpr_scores = []
-        
-        for fold_idx, (train_providers, test_providers) in enumerate(self.folds):
-            # Split data
-            train_df, test_df = split_data_by_providers(
-                self.df, train_providers, test_providers, stratify_col
-            )
-            
-            # Prepare data
-            X_train = train_df.drop(columns=[target_col, stratify_col]).compute()
-            y_train = train_df[target_col].compute()
-            X_test = test_df.drop(columns=[target_col, stratify_col]).compute()
-            y_test = test_df[target_col].compute()
-            
-            # Train model
-            model = lgb.LGBMClassifier(**params)
-            model.fit(X_train, y_train)
-            
-            # Predict and evaluate
-            y_pred_proba = model.predict_proba(X_test)[:, 1]
-            aucpr = calculate_aucpr(y_test, y_pred_proba)
-            aucpr_scores.append(aucpr)
-            
-            logger.info(f"  Fold {fold_idx + 1}: AUCPR = {aucpr:.4f}")
-        
-        cv_mean = np.mean(aucpr_scores)
-        cv_std = np.std(aucpr_scores)
-        logger.info(f"Trial {trial_num} CV AUCPR: {cv_mean:.4f} ± {cv_std:.4f}")
-        
-        return cv_mean
+        return self._run_cv(params, trial_num, model_type='lightgbm')
         
     def generate_oof_predictions(self):
         """Generate out-of-fold predictions for stacking."""
@@ -436,8 +558,12 @@ class DistributedTrainer:
         logger.info("STEP 4: Generating OOF Predictions for Stacking")
         logger.info("="*60)
         
-        target_col = self.config['validation']['target_column']
         stratify_col = self.config['validation']['stratify_by']
+        
+        if self._undersample_enabled:
+            logger.info(f">>> OOF: UNDERSAMPLING ENABLED - Ratio 1:{self._undersample_ratio} <<<")
+        else:
+            logger.info(">>> OOF: UNDERSAMPLING DISABLED - using full training data <<<")
         
         # Get full data length
         total_rows = len(self.df)
@@ -455,16 +581,15 @@ class DistributedTrainer:
         for fold_idx, (train_providers, test_providers) in enumerate(self.folds):
             logger.info(f"Processing fold {fold_idx + 1}/{len(self.folds)}")
             
-            # Split data
+            # Split data (lazy Dask operation)
             train_df, test_df = split_data_by_providers(
                 self.df, train_providers, test_providers, stratify_col
             )
             
-            # Prepare data
-            X_train = train_df.drop(columns=[target_col, stratify_col]).compute()
-            y_train = train_df[target_col].compute()
-            X_test = test_df.drop(columns=[target_col, stratify_col]).compute()
-            y_test = test_df[target_col].compute()
+            # Prepare fold data (handles undersampling + compute)
+            X_train, y_train, X_test, y_test = self._prepare_fold_data(
+                train_df, test_df, fold_idx, random_state=42, phase="OOF"
+            )
             
             # Get test indices
             test_mask = provider_col.isin(test_providers)
@@ -525,7 +650,7 @@ class DistributedTrainer:
         logger.info(f"Stacker coefficients - XGB: {self.stacker.coef_[0][0]:.4f}, LGBM: {self.stacker.coef_[0][1]:.4f}")
         
     def train_final_models(self):
-        """Train final models on full dataset."""
+        """Train final models on full dataset with undersampling."""
         logger.info("="*60)
         logger.info("STEP 6: Training Final Models on Full Data")
         logger.info("="*60)
@@ -533,11 +658,27 @@ class DistributedTrainer:
         target_col = self.config['validation']['target_column']
         stratify_col = self.config['validation']['stratify_by']
         
-        # Prepare full dataset
-        X_full = self.df.drop(columns=[target_col, stratify_col]).compute()
-        y_full = self.df[target_col].compute()
+        if self._undersample_enabled:
+            logger.info(f">>> FINAL MODELS: UNDERSAMPLING ENABLED - Ratio 1:{self._undersample_ratio} <<<")
+        else:
+            logger.info(">>> FINAL MODELS: UNDERSAMPLING DISABLED - using full data <<<")
         
-        logger.info(f"Training on full dataset: {len(X_full):,} rows")
+        # Apply Dask-level undersampling BEFORE .compute() (per design doc 3.1)
+        df_to_train = self.df
+        if self._undersample_enabled:
+            logger.info("Applying Dask-level undersampling on full dataset...")
+            df_to_train = undersample_dask_dataframe(
+                self.df, target_col,
+                ratio=self._undersample_ratio,
+                random_state=42
+            )
+        
+        # NOW .compute() on (undersampled) data
+        logger.info("Computing training data...")
+        X_full = df_to_train.drop(columns=[target_col, stratify_col]).compute()
+        y_full = df_to_train[target_col].compute()
+        
+        logger.info(f"Training on dataset: {len(X_full):,} rows")
         
         # Train final XGBoost
         logger.info("Training final XGBoost model...")
@@ -576,7 +717,8 @@ class DistributedTrainer:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        with mlflow.start_run(run_name="final-models") as run:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with mlflow.start_run(run_name=f"final-models_{timestamp}") as run:
             
             # Save XGBoost
             xgb_path = output_path / "model_xgb.json"
@@ -606,8 +748,62 @@ class DistributedTrainer:
             mlflow.log_artifact(params_path)
             logger.info(f"Saved best params to {params_path}")
             
+            # Save feature importance (per design doc Section 4.3)
+            self._save_feature_importance(output_path)
+            
             logger.info(f"All artifacts saved to {output_path}")
             logger.info(f"MLflow run ID: {run.info.run_id}")
+    
+    def _save_feature_importance(self, output_path):
+        """
+        Extract and save top 20 feature importances to CSV and MLflow.
+        
+        Per design doc: Log feature importance to understand why the model
+        makes predictions, ensuring it learns fraud patterns (Z-scores) not noise.
+        """
+        logger.info("Extracting feature importance...")
+        
+        try:
+            # Get feature names from training data
+            target_col = self.config['validation']['target_column']
+            stratify_col = self.config['validation']['stratify_by']
+            feature_names = [c for c in self.df.columns 
+                           if c not in [target_col, stratify_col]]
+            
+            # XGBoost feature importance
+            xgb_importance = self.final_xgb.feature_importances_
+            xgb_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance_xgb': xgb_importance
+            }).sort_values('importance_xgb', ascending=False)
+            
+            # LightGBM feature importance  
+            lgbm_importance = self.final_lgbm.feature_importances_
+            lgbm_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance_lgbm': lgbm_importance
+            }).sort_values('importance_lgbm', ascending=False)
+            
+            # Merge and compute average importance
+            importance_df = xgb_df.merge(lgbm_df, on='feature')
+            importance_df['importance_avg'] = (
+                importance_df['importance_xgb'] + importance_df['importance_lgbm']
+            ) / 2
+            importance_df = importance_df.sort_values('importance_avg', ascending=False)
+            
+            # Save top 20 features
+            top_20 = importance_df.head(20)
+            importance_path = output_path / "feature_importance.csv"
+            top_20.to_csv(importance_path, index=False)
+            mlflow.log_artifact(importance_path)
+            
+            logger.info(f"Saved top 20 feature importance to {importance_path}")
+            logger.info("Top 5 features:")
+            for _, row in top_20.head(5).iterrows():
+                logger.info(f"  {row['feature']}: {row['importance_avg']:.4f}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to save feature importance: {e}")
     
     def run_training(self):
         """Main training pipeline execution."""

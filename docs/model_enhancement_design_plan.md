@@ -82,7 +82,6 @@ For Ratio 1:100:
 ## 4. Metric & Observability Updates (Implemented)
 
 **File:** `src/utils/evaluation.py`  
-**Status:** Completed and Live.
 
 ### 4.1 Implemented Metrics & Logic
 

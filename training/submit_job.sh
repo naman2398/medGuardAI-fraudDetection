@@ -55,19 +55,35 @@ echo "Submitting Vertex AI job..."
 
 # Always use latest tag so jobs get the most recent image
 WORKER_POOL_0="machine-type=${PRIMARY_MACHINE},replica-count=1,container-image-uri=${IMAGE_URI_LATEST}"
-WORKER_POOL_1="machine-type=${WORKER_MACHINE},replica-count=${WORKER_COUNT},container-image-uri=${IMAGE_URI_LATEST}"
 
-gcloud ai custom-jobs create \
-  --region=${REGION} \
-  --display-name=${JOB_NAME} \
-  --worker-pool-spec="${WORKER_POOL_0}" \
-  --worker-pool-spec="${WORKER_POOL_1}" \
-  --args="--n_rows_sample=${N_ROWS_SAMPLE}" \
-  --args="--xgb_trials=${XGB_TRIALS}" \
-  --args="--lgbm_trials=${LGBM_TRIALS}" \
-  --args="--cv_folds=${CV_FOLDS}" \
-  --args="--worker_count=${WORKER_COUNT}" \
-  --project=${PROJECT_ID}
+# Only add worker pool if WORKER_COUNT > 0
+if [ "${WORKER_COUNT}" -gt 0 ]; then
+  WORKER_POOL_1="machine-type=${WORKER_MACHINE},replica-count=${WORKER_COUNT},container-image-uri=${IMAGE_URI_LATEST}"
+  
+  gcloud ai custom-jobs create \
+    --region=${REGION} \
+    --display-name=${JOB_NAME} \
+    --worker-pool-spec="${WORKER_POOL_0}" \
+    --worker-pool-spec="${WORKER_POOL_1}" \
+    --args="--n_rows_sample=${N_ROWS_SAMPLE}" \
+    --args="--xgb_trials=${XGB_TRIALS}" \
+    --args="--lgbm_trials=${LGBM_TRIALS}" \
+    --args="--cv_folds=${CV_FOLDS}" \
+    --args="--worker_count=${WORKER_COUNT}" \
+    --project=${PROJECT_ID}
+else
+  # Single machine mode - no worker pool
+  gcloud ai custom-jobs create \
+    --region=${REGION} \
+    --display-name=${JOB_NAME} \
+    --worker-pool-spec="${WORKER_POOL_0}" \
+    --args="--n_rows_sample=${N_ROWS_SAMPLE}" \
+    --args="--xgb_trials=${XGB_TRIALS}" \
+    --args="--lgbm_trials=${LGBM_TRIALS}" \
+    --args="--cv_folds=${CV_FOLDS}" \
+    --args="--worker_count=${WORKER_COUNT}" \
+    --project=${PROJECT_ID}
+fi
 
 echo ""
 echo "✓ Job submitted: ${JOB_NAME}"

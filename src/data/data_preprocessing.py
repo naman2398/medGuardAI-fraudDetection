@@ -7,6 +7,7 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import DoubleType
 from pyspark.sql.functions import floor
+from pyspark.sql.window import Window
 from google.cloud import bigquery
 import logging
 
@@ -24,7 +25,7 @@ BUCKET_BASE_SUMMARY = "gs://medguard_rawdata/raw/cms_partb_summary_data"
 LEIE_PATH = "gs://medguard_rawdata/raw/fraud_labels/"
 
 BIGQUERY_DATASET = "medguard_processed_all_years"
-BIGQUERY_TABLE = "fraud_training_data_all_years"
+BIGQUERY_TABLE = "fraud_training_data_enhanced_v2"  # New table with Z-score & risk ratio features
 BIGQUERY_LOCATION = "US"
 STAGING_BUCKET = "medguard_rawdata"
 
@@ -58,6 +59,191 @@ string_columns = [
     'rndrng_prvdr_ent_cd', 'rndrng_prvdr_type', 'rndrng_prvdr_mdcr_prtcptg_ind',
     'hcpcs_drug_ind', 'place_of_srvc'
 ]
+
+# Columns for Z-score computation (peer comparison features)
+ZSCORE_NUMERIC_COLS = [
+    'tot_srvcs',
+    'avg_mdcr_pymt_amt',
+    'tot_benes',
+    'avg_sbmtd_chrg'
+]
+
+
+# Phase 0: Z-Score and Risk Ratio Features (NEW - Model Enhancement)
+def compute_zscore_features(df, group_col='rndrng_prvdr_type', numeric_cols=None):
+    """
+    Compute peer-relative Z-scores and ratios for numeric columns.
+    
+    Z-scores normalize values relative to the provider's specialty group,
+    enabling detection of outliers within peer groups.
+    
+    Args:
+        df: PySpark DataFrame with aggregated features
+        group_col: Column to partition by (default: provider specialty)
+        numeric_cols: List of numeric columns to compute Z-scores for
+        
+    Returns:
+        DataFrame with additional Z-score and ratio columns
+    """
+    if numeric_cols is None:
+        numeric_cols = ZSCORE_NUMERIC_COLS
+    
+    logger.info(f"Computing Z-score features for {len(numeric_cols)} columns...")
+    logger.info(f"Partitioning by: {group_col}")
+    
+    # Define window spec partitioned by provider specialty
+    window_spec = Window.partitionBy(group_col)
+    
+    for col_name in numeric_cols:
+        # Check if column exists (handle different naming from aggregation)
+        # Try both raw name and aggregated name patterns
+        actual_col = None
+        for candidate in [col_name, f"{col_name}_sum", f"{col_name}_mean"]:
+            if candidate in df.columns:
+                actual_col = candidate
+                break
+        
+        if actual_col is None:
+            logger.warning(f"Column {col_name} not found, skipping Z-score computation")
+            continue
+            
+        logger.info(f"  Computing Z-score for: {actual_col}")
+        
+        # Calculate group statistics
+        group_mean_col = f"{col_name}_group_mean"
+        group_std_col = f"{col_name}_group_std"
+        
+        df = df.withColumn(
+            group_mean_col,
+            mean(col(actual_col)).over(window_spec)
+        )
+        
+        df = df.withColumn(
+            group_std_col,
+            stddev(col(actual_col)).over(window_spec)
+        )
+        
+        # Handle NULL/zero stddev (single-row groups or identical values)
+        # Use small epsilon (0.01) to avoid division by zero
+        df = df.withColumn(
+            group_std_col,
+            when(
+                (col(group_std_col).isNull()) | (col(group_std_col) == 0),
+                lit(0.01)
+            ).otherwise(col(group_std_col))
+        )
+        
+        # Compute Z-score: (X - μ) / σ
+        zscore_col = f"{col_name}_zscore"
+        df = df.withColumn(
+            zscore_col,
+            (col(actual_col) - col(group_mean_col)) / col(group_std_col)
+        )
+        
+        # Compute Ratio: X / μ (with safeguard for zero mean)
+        ratio_col = f"{col_name}_ratio"
+        df = df.withColumn(
+            ratio_col,
+            when(
+                col(group_mean_col) == 0,
+                lit(1.0)  # If group mean is 0, ratio is 1 (no deviation)
+            ).otherwise(
+                col(actual_col) / col(group_mean_col)
+            )
+        )
+        
+        # Drop intermediate columns (keep only zscore and ratio)
+        df = df.drop(group_mean_col, group_std_col)
+        
+        logger.info(f"    Created: {zscore_col}, {ratio_col}")
+    
+    # Log summary of new features
+    zscore_cols = [c for c in df.columns if '_zscore' in c or '_ratio' in c]
+    logger.info(f"✓ Z-score feature computation complete. Added {len(zscore_cols)} columns")
+    
+    return df
+
+
+def compute_risk_ratios(df):
+    """
+    Compute risk ratio features known to correlate with fraud.
+    
+    These are explicit interaction features derived from domain knowledge:
+    - Billing Inflation: Ratio of submitted charges to Medicare payment
+    - Service Density: Ratio of services to unique beneficiaries
+    
+    Args:
+        df: PySpark DataFrame with aggregated features
+        
+    Returns:
+        DataFrame with additional risk ratio columns
+    """
+    logger.info("Computing risk ratio features...")
+    
+    # Billing Inflation: avg_sbmtd_chrg / avg_mdcr_pymt_amt
+    # High values indicate excessive upcoding or billing inflation
+    # Find the actual column names (may be aggregated)
+    sbmtd_col = None
+    pymt_col = None
+    srvcs_col = None
+    benes_col = None
+    
+    # Check for aggregated column names
+    for candidate in ['avg_sbmtd_chrg', 'average_submitted_chrg_amt_sum', 'average_submitted_chrg_amt_mean']:
+        if candidate in df.columns:
+            sbmtd_col = candidate
+            break
+            
+    for candidate in ['avg_mdcr_pymt_amt', 'average_medicare_payment_amt_sum', 'average_medicare_payment_amt_mean']:
+        if candidate in df.columns:
+            pymt_col = candidate
+            break
+            
+    for candidate in ['tot_srvcs', 'line_srvc_cnt_sum', 'line_srvc_cnt_mean']:
+        if candidate in df.columns:
+            srvcs_col = candidate
+            break
+            
+    for candidate in ['tot_benes', 'bene_unique_cnt_sum', 'bene_unique_cnt_mean']:
+        if candidate in df.columns:
+            benes_col = candidate
+            break
+    
+    if sbmtd_col and pymt_col:
+        logger.info(f"  Computing billing_inflation from {sbmtd_col} / {pymt_col}")
+        df = df.withColumn(
+            'billing_inflation',
+            when(
+                (col(pymt_col).isNull()) | (col(pymt_col) == 0),
+                lit(1.0)  # Default to 1.0 if payment is 0 or null
+            ).otherwise(
+                col(sbmtd_col) / col(pymt_col)
+            )
+        )
+        logger.info("    Created: billing_inflation")
+    else:
+        logger.warning(f"Could not compute billing_inflation: sbmtd={sbmtd_col}, pymt={pymt_col}")
+    
+    # Service Density: tot_srvcs / tot_benes
+    # High values indicate potential churning or unnecessary services
+    if srvcs_col and benes_col:
+        logger.info(f"  Computing service_density from {srvcs_col} / {benes_col}")
+        df = df.withColumn(
+            'service_density',
+            when(
+                (col(benes_col).isNull()) | (col(benes_col) == 0),
+                lit(1.0)  # Default to 1.0 if no beneficiaries
+            ).otherwise(
+                col(srvcs_col) / col(benes_col)
+            )
+        )
+        logger.info("    Created: service_density")
+    else:
+        logger.warning(f"Could not compute service_density: srvcs={srvcs_col}, benes={benes_col}")
+    
+    logger.info("✓ Risk ratio computation complete")
+    
+    return df
 
 
 # Phase 1: Cleaning
@@ -476,6 +662,28 @@ def main():
     
     df_aggregated = df_aggregated.cache()
     logger.info(f"Aggregated data cached. Total rows: {df_aggregated.count()}")
+    
+    # Phase 2.5: Z-Score and Risk Ratio Features (NEW - Model Enhancement)
+    logger.info("="*60)
+    logger.info("PHASE 2.5: Z-Score and Risk Ratio Features")
+    logger.info("="*60)
+    
+    # Compute Z-scores relative to provider specialty
+    df_aggregated = compute_zscore_features(
+        df_aggregated, 
+        group_col='rndrng_prvdr_type',
+        numeric_cols=['line_srvc_cnt', 'average_medicare_payment_amt', 
+                      'bene_unique_cnt', 'average_submitted_chrg_amt']
+    )
+    
+    # Compute risk ratio features
+    df_aggregated = compute_risk_ratios(df_aggregated)
+    
+    # Re-cache after adding new features
+    df_aggregated = df_aggregated.cache()
+    new_feature_cols = [c for c in df_aggregated.columns if '_zscore' in c or '_ratio' in c 
+                        or c in ['billing_inflation', 'service_density']]
+    logger.info(f"New enhancement features added: {new_feature_cols}")
     
     # Phase 3: Enrichment
     logger.info("="*60)

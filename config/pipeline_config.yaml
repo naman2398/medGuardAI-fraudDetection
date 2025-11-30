@@ -16,13 +16,13 @@ mlflow:
 # Model Configuration
 models:
   xgboost:
-    n_trials: 20  # Production: 20 trials, override with XGB_TRIALS for testing
-    cv_folds: 5   # Production: 5 folds, override with CV_FOLDS for testing
+    n_trials: 5  # Production: 20 trials, override with XGB_TRIALS for testing
+    cv_folds: 3   # Production: 5 folds, override with CV_FOLDS for testing
     random_state: 42
     
   lightgbm:
-    n_trials: 20  # Production: 20 trials, override with LGBM_TRIALS for testing
-    cv_folds: 5   # Production: 5 folds, override with CV_FOLDS for testing
+    n_trials: 5  # Production: 20 trials, override with LGBM_TRIALS for testing
+    cv_folds: 3   # Production: 5 folds, override with CV_FOLDS for testing
     random_state: 42
     
   stacker:
@@ -34,14 +34,24 @@ validation:
   stratify_by: "rndrng_npi"  # Entity-level stratification (provider NPI)
   target_column: "fraud_label"
   positive_class_ratio: 0.0004  # 0.04%
+
+# Sampling Configuration (Model Enhancement)
+sampling:
+  undersample_enabled: true  # Enable aggressive undersampling for training
+  undersample_ratio: 100     # Normal:Fraud ratio (1:100 means 100 normal per 1 fraud)
+  
+# Evaluation Configuration (Model Enhancement)
+evaluation:
+  decision_threshold: 0.0004  # Prior class probability for threshold-based metrics
+  primary_metric: "f2"        # F2-Score balances recall (2x weight) with precision
   
 # Dask Configuration
 dask:
-  use_distributed: true  # Enable distributed mode for multi-node Vertex AI
-  scheduler_address: null  # Auto-detected from cluster
-  n_workers: 2
-  threads_per_worker: 4
-  memory_limit: "auto"  # Use 80% of available system memory
+  use_distributed: false  # Single high-memory machine for fastest compute
+  scheduler_address: null
+  n_workers: 8            # Match vCPUs for parallel CV folds
+  threads_per_worker: 2   # 2 threads per worker = 16 total threads
+  memory_limit: "auto"    # Uses ~100GB on n2-highmem-16
   
 # GCP Configuration
 gcp:
@@ -53,12 +63,12 @@ gcp:
 # Compute Configuration
 compute:
   primary:
-    machine_type: "e2-standard-4"
-    vcpus: 4
-    memory_gb: 16
+    machine_type: "n2-highmem-16"  # High-memory for fastest compute
+    vcpus: 16
+    memory_gb: 128
   workers:
-    machine_type: "n2-standard-8"  # Production: n2-standard-8, override with WORKER_MACHINE for testing
-    vcpus: 8
-    memory_gb: 32
-    count: 2  # Production: 2 workers, override with WORKER_COUNT for testing
+    machine_type: "n2-highmem-16"
+    vcpus: 16
+    memory_gb: 128
+    count: 0  # No workers needed - single machine mode
   use_preemptible: true  # Use preemptible VMs for 60-80% cost savings
